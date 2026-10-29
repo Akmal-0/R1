@@ -1,88 +1,36 @@
 #include <Arduino.h>
+#include <Adafruit_BNO055.h>
 #include <config.h>
 #include <pid.h>
 #include <kinematic.h>
 #include <odometry.h>
-#include <imu.h>
-#include <USBHost_t36.h>
-#include <IRremote.hpp>
-#include <Servo.h>
+#include <joystick.h>
+#include <scurve.h>
+#include <semiauto.h>
 
-Servo myservo;
+// Manager Joystick USB Host
+JoystickManager joyManager;
+ButtonState &button = joyManager.button;
+AxisState &joystick = joyManager.axis;
 
-template <int j>
+// Filter S-Curve Pelembut Gerak Base Manual (Jerk-Limited)
+SCurveFilter scurve_x(SCURVE_MAX_ACCEL_LINEAR, SCURVE_MAX_JERK_LINEAR);
+SCurveFilter scurve_y(SCURVE_MAX_ACCEL_LINEAR, SCURVE_MAX_JERK_LINEAR);
+SCurveFilter scurve_wz(SCURVE_MAX_ACCEL_ANGULAR, SCURVE_MAX_JERK_ANGULAR);
 
-void readEncoder();
-void setMotor(int cwPin, int ccwPin, float pwmVal);
-void button_list(uint32_t buttons, int joy_axis);
-void moveBase();
-void Emergencystop();
-void calculate_smooth_vel(double &current_output, double input_value, double deltaT, double max_acceleration_);
+// Sensor IMU BNO055 (I2C Wire1: SDA1=16, SCL1=17)
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire1);
 
-void lifter();
-void staff();
-void push();
-void grip();
+// Kontroler Semi-Auto 5 Meter & Encoder Eksternal X/Y
+SemiAutoController semiAuto;
 
-void handleSpeedToggle();
-void printButtonActive();
-void printAxis();
-void kontrolServo();
-void motorSlideGo();
-void motorslide();
-
-USBHost usb_joy;
-USBHub joy_hub(usb_joy);
-USBHIDParser hid_joy(usb_joy);
-
-#define COUNT_JOYSTICKS 4
-
-JoystickController joy_control[COUNT_JOYSTICKS]{
-	JoystickController(usb_joy), JoystickController(usb_joy),
-	JoystickController(usb_joy), JoystickController(usb_joy)};
-int user_axis[64];
-uint32_t buttons_prev = 0;
-
-USBDriver *drivers[] = {&joy_hub, &joy_control[0], &joy_control[1], &joy_control[2], &joy_control[3], &hid_joy};
-#define CNT_DEVICES (sizeof(drivers) / sizeof(drivers[0]))
-const char *driver_names[CNT_DEVICES] = {"Hub1", "joystick[0D]", "joystick[1D]", "joystick[2D]", "joystick[3D]", "HID1"};
-bool driver_active[CNT_DEVICES] = {false, false, false, false};
-
-USBHIDInput *hiddrivers[] = {&joy_control[0], &joy_control[1], &joy_control[2], &joy_control[3]};
-#define CNT_HIDDEVICES (sizeof(hiddrivers) / sizeof(hiddrivers[0]))
-const char *hid_driver_names[CNT_DEVICES] = {"joystick[0H]", "joystick[1H]", "joystick[2H]", "joystick[3H]"};
-bool hid_driver_active[CNT_DEVICES] = {false};
-bool show_changed_only = false;
-
-uint8_t joystick_left_trigger_value[COUNT_JOYSTICKS] = {0};
-uint8_t joystick_right_trigger_value[COUNT_JOYSTICKS] = {0};
-uint64_t joystick_full_notify_mask = (uint64_t)-1;
-
-unsigned long prev_odom_update = 0;
-unsigned long prevT = 0;
-
-unsigned long lastJoystickTime = 0;
-const unsigned long JOYSTICK_TIMEOUT = 300;
-
-// bool speedModeFast = false;
-// bool lastButtonUp = false;
-
-static bool speedModeFast = false;
-static bool lastButtonUp = false;
-static unsigned long lastToggleTime = 0;
-
-bool smoothed = false;
-// unsigned long prevT = 0;
-
-// Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire2); //18 19
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire1); // 16 17
-volatile long pos[4];
-
+// Kontroler PID Motor Base (4 roda omni)
 PID wheel1(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel2(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel3(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel4(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 
+// Kinematika 4-Roda Omniwheel
 Kinematic kinematic(
 	Kinematic::ROBOT_1,
 	MOTOR_MAX_RPS,
@@ -92,237 +40,209 @@ Kinematic kinematic(
 	WHEEL_DIAMETER,
 	ROBOT_DIAMETER);
 
+// Odometri Base
 Odometry odometry;
 
-IMU imu_sensor;
+// Variabel Waktu & Odometri Base
+unsigned long prev_odom_update = 0;
+unsigned long prevT = 0;
+volatile long pos[4];
 
-IRsend irsend;
+// Kecepatan Robot Base
+joy joySmoothed;
+joy joyCmd;
 
-bool lastBtn1 = false;
-bool lastBtn2 = false;
+template <int j>
+void readEncoder();
+void setMotor(int cwPin, int ccwPin, float pwmVal);
+void moveBase();
+void Emergencystop();
+
+template <int j>
+void readEncoder()
+{
+	int b = digitalRead(encb[j]);
+	if (b > 0)
+		pos[j]++;
+	else
+		pos[j]--;
+}
 
 void setup()
 {
 	Serial.begin(115200);
-	usb_joy.begin();
 
-	bno.begin();
-	bno.setExtCrystalUse(true);
-
-	// joy_control[0].joystickType();
-
-	pinMode(sol1, OUTPUT);
-	pinMode(sol2, OUTPUT);
-	pinMode(sol3, OUTPUT);
-	pinMode(sol4, OUTPUT);
-
-	for (int i = 0; i < 4; i++) // Ubah dari 3 ke 4 untuk 4 motor
+	// Inisialisasi pin motor base (PWM 25 kHz, 8-bit)
+	for (int i = 0; i < 4; i++)
 	{
 		pinMode(cw[i], OUTPUT);
 		pinMode(ccw[i], OUTPUT);
 
 		analogWriteFrequency(cw[i], PWM_FREQUENCY);
 		analogWriteFrequency(ccw[i], PWM_FREQUENCY);
-
 		analogWriteResolution(PWM_BITS);
 		analogWrite(cw[i], 0);
 		analogWrite(ccw[i], 0);
-
 		pinMode(enca[i], INPUT);
 		pinMode(encb[i], INPUT);
 	}
 
+	// Inisialisasi Joystick USB Host & Sensor IMU
+	joyManager.begin();
+	bno.begin();
+	bno.setExtCrystalUse(true);
+
+	// Inisialisasi Semi-Auto & Encoder Eksternal (X & Y)
+	semiAuto.begin();
+
+	// Konfigurasi PPR PID roda
 	wheel1.ppr_total(COUNTS_PER_REV1);
 	wheel2.ppr_total(COUNTS_PER_REV2);
 	wheel3.ppr_total(COUNTS_PER_REV3);
 	wheel4.ppr_total(COUNTS_PER_REV4);
 
+	// Registrasi Interrupt Encoder Roda Base
 	attachInterrupt(digitalPinToInterrupt(enca[0]), readEncoder<0>, RISING);
 	attachInterrupt(digitalPinToInterrupt(enca[1]), readEncoder<1>, RISING);
 	attachInterrupt(digitalPinToInterrupt(enca[2]), readEncoder<2>, RISING);
 	attachInterrupt(digitalPinToInterrupt(enca[3]), readEncoder<3>, RISING);
-
-	myservo.attach(9);
-	myservo.write(0);
-
-	pinMode(LED, OUTPUT);
-
-	pinMode(pinIN1, OUTPUT);
-	pinMode(pinIN2, OUTPUT);
-
-	pinMode(motorpush, OUTPUT);
-	pinMode(motorpull, OUTPUT);
-
-	pinMode(motorup, OUTPUT);
-	pinMode(motordown, OUTPUT);
-
-	pinMode(limit1, INPUT_PULLUP);
-	pinMode(limit2, INPUT_PULLUP);
-
-	pinMode(limit3, INPUT_PULLUP);
-	pinMode(limit4, INPUT_PULLUP);
-
-	irsend.begin(IR_SEND_PIN, false);
-}
-
-int applyDeadzone(int value, int deadzone = 15) // 10
-{
-	if (abs(value) < deadzone)
-	{
-		return 0;
-	}
-	return value;
 }
 
 void loop()
 {
-	usb_joy.Task();
+	joyManager.task();
 
-	bool btn1 = button.select;
-	bool btn2 = button.start;
-
-	if (!joy_control[0])
+	// Tangani kondisi joystick terputus secara fisik
+	if (!joyManager.isConnected())
 	{
 		Emergencystop();
-		lastJoystickTime = 0;
+		joyManager.handleDisconnect();
 		delay(100);
 		return;
 	}
-	if (joy_control[0].available())
+
+	// Tangani paket laporan data baru dari joystick
+	if (joyManager.update())
 	{
+		if (!joyManager.isReady())
+		{
+			uint64_t axesSeen = joyManager.getAxesSeen();
+			if (!joyManager.qualifyReady())
+			{
+				Emergencystop();
+				joyManager.restoreAxesSeen(axesSeen);
+				return;
+			}
 
-		lastJoystickTime = millis();
+			prevT = micros();
+			prev_odom_update = millis();
+		}
 
-		uint32_t buttons = joy_control[0].getButtons();
-		button_list(buttons, joy_control[0].getAxis(9));
+		// Tombol Kontrol Semi-Auto (Maju 5m: Tombol Y, Mundur 5m: Tombol A, Batal: Tombol B)
+		static bool lastBtnY = false;
+		static bool lastBtnA = false;
+		static bool lastBtnB = false;
 
-		joystick.axis1_x = applyDeadzone(joy_control[0].getAxis(1) - 128);
-		joystick.axis1_y = applyDeadzone(joy_control[0].getAxis(0) - 128);
-		joystick.axis0_x = applyDeadzone(joy_control[0].getAxis(5) - 128);
-		joystick.axis0_y = applyDeadzone(joy_control[0].getAxis(2) - 128);
+		if (button.Y && !lastBtnY)
+		{
+			sensors_event_t event;
+			bno.getEvent(&event, Adafruit_BNO055::VECTOR_EULER);
+			semiAuto.triggerForward(-event.orientation.x);
+		}
+		else if (button.A && !lastBtnA)
+		{
+			sensors_event_t event;
+			bno.getEvent(&event, Adafruit_BNO055::VECTOR_EULER);
+			semiAuto.triggerBackward(-event.orientation.x);
+		}
+		else if (button.B && !lastBtnB)
+		{
+			semiAuto.cancel();
+		}
 
-		handleSpeedToggle();
-		moveBase();
-		motorSlideGo();
-		motorslide();
-		kontrolServo();
-		lifter();
-		staff();
-		grip();
-		push();
-		// gripperSequence();
-		// gripper();
-		// printButtonActive();
-		// printAxis();
+		lastBtnY = button.Y;
+		lastBtnA = button.A;
+		lastBtnB = button.B;
+
+		if (!joyManager.isTimeout())
+		{
+			moveBase();
+		}
 	}
 
-	if (btn1 && !lastBtn1)
-	{
-		irsend.sendNECRaw(0x05FA05FA, 0);
-		// Serial.println("Button A");
-
-		digitalWrite(LED, HIGH);
-		delay(80);
-		digitalWrite(LED, LOW);
-	}
-
-	if (btn2 && !lastBtn2)
-	{
-		irsend.sendNECRaw(0x30CF50AF, 0);
-		// Serial.println("Button B");
-
-		digitalWrite(LED, HIGH);
-		delay(80);
-		digitalWrite(LED, LOW);
-	}
-
-	lastBtn1 = btn1;
-	lastBtn2 = btn2;
-
-	if (millis() - lastJoystickTime > JOYSTICK_TIMEOUT)
+	// Watchdog timeout joystick
+	if (joyManager.isTimeout())
 	{
 		Emergencystop();
 	}
 }
 
-joy joySmoothed;
-joy joyCmd;
-// bool smoothed = false;
-
 void moveBase()
 {
+	if (!joyManager.isReady())
+	{
+		Emergencystop();
+		return;
+	}
+
 	sensors_event_t event;
 	bno.getEvent(&event, Adafruit_BNO055::VECTOR_EULER);
 
 	unsigned long currT = micros();
 	float deltaT = ((float)(currT - prevT)) / 1.0e6;
 
-	float top_speed;
-	float rot_speed;
-
-	if (speedModeFast)
+	// Mode 1: Semi-Auto (Gerak lurus maju/mundur otomatis dipandu encoder eksternal)
+	if (semiAuto.isBusy())
 	{
-		// fast
-		top_speed = 2.0;
-		rot_speed = 0.9;
+		// Manual Override: Batalkan semi-auto seketika jika driver menyentuh stik joystick
+		if (joyManager.isManualInput())
+		{
+			semiAuto.cancel();
+		}
+		else
+		{
+			float autoVx = 0.0f;
+			float autoVy = 0.0f;
+			float autoWz = 0.0f;
+			semiAuto.update(deltaT, -event.orientation.x, autoVx, autoVy, autoWz);
+
+			joySmoothed.axis1_x = autoVx;
+			joySmoothed.axis1_y = autoVy;
+			joySmoothed.axis0_y = autoWz;
+		}
 	}
-	else
+
+	// Mode 2: Manual Joystick
+	if (!semiAuto.isBusy())
 	{
-		// slow
-		top_speed = 0.5;
-		rot_speed = 0.3;
+		float top_speed;
+		float rot_speed;
+		if (joyManager.isSpeedFast())
+		{
+			top_speed = SPEED_FAST_TOP;
+			rot_speed = SPEED_FAST_ROT;
+		}
+		else
+		{
+			top_speed = SPEED_SLOW_TOP;
+			rot_speed = SPEED_SLOW_ROT;
+		}
+
+		joyCmd.axis1_x = map(-joystick.axis1_x, 0, 128, 0, top_speed);
+		joyCmd.axis1_y = map(joystick.axis1_y, 0, 128, 0, top_speed);
+		joyCmd.axis0_y = map(joystick.axis0_y, 0, 128, 0, rot_speed);
+
+		// Profil S-Curve untuk translasi dan rotasi manual
+		joySmoothed.axis1_x = scurve_x.update(joyCmd.axis1_x, deltaT);
+		joySmoothed.axis1_y = scurve_y.update(joyCmd.axis1_y, deltaT);
+		joySmoothed.axis0_y = scurve_wz.update(joyCmd.axis0_y, deltaT);
 	}
-
-	// float top_speed = 1.5;
-	// float rot_speed = 1.0;
-
-	joystick.axis1_x = map(-joystick.axis1_x, 0, 128, 0, top_speed);
-	joystick.axis1_y = map(joystick.axis1_y, 0, 128, 0, top_speed);
-	joystick.axis0_y = map(joystick.axis0_y, 0, 128, 0, rot_speed);
-
-	// FLOAT SAFE
-	//  joystick.axis1_x = (-joystick.axis1_x / 128.0) * top_speed;
-	//  joystick.axis1_y = ( joystick.axis1_y / 128.0) * top_speed;
-	//  joystick.axis0_y = ( joystick.axis0_y / 128.0) * rot_speed;
-
-	joyCmd.axis1_x = joystick.axis1_x;
-	joyCmd.axis1_y = joystick.axis1_y;
-	joyCmd.axis0_y = joystick.axis0_y;
-
-	calculate_smooth_vel(joySmoothed.axis1_x, joystick.axis1_x, deltaT, 1.0);
-	calculate_smooth_vel(joySmoothed.axis1_y, joystick.axis1_y, deltaT, 1.0);
-	calculate_smooth_vel(joySmoothed.axis0_y, joystick.axis0_y, deltaT, 1.0);
-
-	// if (button.left == 1)
-	// {
-	// 	smoothed = true;
-	// }
-	// else if (button.right == 1)
-	// {
-	// 	smoothed = false;
-	// }
-	// if (smoothed)
-	// {
-	// 	joyCmd.axis1_x = joySmoothed.axis1_x;
-	// 	joyCmd.axis1_y = joySmoothed.axis1_y;
-	// 	joyCmd.axis0_y = joySmoothed.axis0_y;
-
-	// 	joyCmd.axis1_x = joystick.axis1_x;
-	// 	joyCmd.axis1_y = joystick.axis1_y;
-	// 	joyCmd.axis0_y = joystick.axis0_y;
-	// }
-	// else if (!smoothed)
-	// {
-	// 	joyCmd.axis1_x = joystick.axis1_x;
-	// 	joyCmd.axis1_y = joystick.axis1_y;
-	// 	joyCmd.axis0_y = joystick.axis0_y;
-	// }
 
 	Kinematic::rps req_rps;
 	req_rps = kinematic.getRPS(
-		joyCmd.axis1_x,
-		-joyCmd.axis1_y,
-		joyCmd.axis0_y,
+		joySmoothed.axis1_x,
+		-joySmoothed.axis1_y,
+		joySmoothed.axis0_y,
 		-event.orientation.x);
 
 	float controlled_motor1 = wheel1.control_speed(req_rps.motor1, pos[0], deltaT);
@@ -335,32 +255,14 @@ void moveBase()
 	float current_rps3 = wheel3.get_filt_vel();
 	float current_rps4 = wheel4.get_filt_vel();
 
-	// Serial.print(" | ");
-	// Serial.print(pos[0]);
-	// Serial.print(" | ");
-	// Serial.print(pos[1]);
-	// Serial.print(" | ");
-	// Serial.print(pos[2]);
-	// Serial.print(" | ");
-	// Serial.print(pos[3]);
-	// Serial.println(" | ");
-
 	if (fabs(req_rps.motor1) < 0.02)
-	{
 		controlled_motor1 = 0.0;
-	}
 	if (fabs(req_rps.motor2) < 0.02)
-	{
 		controlled_motor2 = 0.0;
-	}
 	if (fabs(req_rps.motor3) < 0.02)
-	{
 		controlled_motor3 = 0.0;
-	}
 	if (fabs(req_rps.motor4) < 0.02)
-	{
 		controlled_motor4 = 0.0;
-	}
 
 	setMotor(cw[0], ccw[0], controlled_motor1);
 	setMotor(cw[1], ccw[1], controlled_motor2);
@@ -375,91 +277,10 @@ void moveBase()
 
 	unsigned long now = millis();
 	float vel_dt = (now - prev_odom_update) / 1000.0;
+
 	prev_odom_update = now;
-
-	odometry.update(
-		vel_dt,
-		vel.linear_x,
-		vel.linear_y,
-		vel.angular_z);
-	Odometry::odom robot_pose;
-	robot_pose = odometry.getData();
-	// Serial.print(" | ");
-	// Serial.print(joySmoothed.axis1_x);
-	// Serial.print(" | ");
-	// Serial.print(joySmoothed.axis1_y);
-	// Serial.print(" | ");
-	// Serial.print(joySmoothed.axis0_y);
-	// Serial.print(" | ");
-	// Serial.print(req_rps.motor1);
-	// Serial.print(" | ");
-	// Serial.print(req_rps.motor2);
-	// Serial.print(" | ");
-	// Serial.print(req_rps.motor3);
-	// Serial.print(" | ");
-	// Serial.print(req_rps.motor4);
-	// Serial.print(" | ");
-
+	odometry.update(vel_dt, vel.linear_x, vel.linear_y, vel.angular_z);
 	prevT = currT;
-}
-
-void handleSpeedToggle()
-{
-	const unsigned long debounceDelay = 150;
-
-	if (button.LB &&
-		!lastButtonUp &&
-		millis() - lastToggleTime > debounceDelay)
-	{
-		speedModeFast = !speedModeFast;
-		lastToggleTime = millis();
-	}
-
-	lastButtonUp = button.LB;
-}
-
-// bool last_call = false;
-// void handle_gear()
-// {
-// 	if (button.up && !last_call)
-// 	{
-// 		speedModeFast = true;
-// 		last_call = true;
-// 	}
-// 	else if (button.up && last_call)
-// 	{
-// 		speedModeFast = false;
-// 		last_call = false;
-// 	}
-// }
-
-void Emergencystop()
-{
-	for (int i = 0; i < 4; i++)
-	{
-		analogWrite(cw[i], 0);
-		analogWrite(ccw[i], 0);
-	}
-}
-
-void calculate_smooth_vel(double &current_output, double input_value, double deltaT, double max_acceleration_)
-{
-	double target = input_value;
-
-	if (input_value == 0.0 && std::abs(current_output) > 1e-6)
-	{
-		target = 0.0;
-	}
-	double max_delta = max_acceleration_ * deltaT;
-
-	double delta_target = target - current_output;
-
-	if (std::abs(delta_target) > max_delta)
-	{
-		delta_target = (delta_target > 0.0) ? max_delta : -max_delta;
-	}
-
-	current_output += delta_target;
 }
 
 void setMotor(int cwPin, int ccwPin, float pwmVal)
@@ -481,370 +302,21 @@ void setMotor(int cwPin, int ccwPin, float pwmVal)
 	}
 }
 
-template <int j>
-void readEncoder()
+void Emergencystop()
 {
-	int b = digitalRead(encb[j]);
-	if (b > 0)
+	joyManager.reset();
+	semiAuto.cancel();
+
+	joyCmd = {};
+	joySmoothed = {};
+
+	scurve_x.reset();
+	scurve_y.reset();
+	scurve_wz.reset();
+
+	for (int i = 0; i < 4; i++)
 	{
-		pos[j]++;
-	}
-	else
-	{
-		pos[j]--;
+		analogWrite(cw[i], 0);
+		analogWrite(ccw[i], 0);
 	}
 }
-
-// bool arahCW = true;
-// bool statusB_Lalu = false;
-
-// void motor1()
-// {
-
-// 	bool tekanA = button.A;
-// 	bool tekanB = button.B;
-
-// 	if (tekanB && !statusB_Lalu)
-// 	{
-// 		arahCW = !arahCW;
-// 	}
-// 	statusB_Lalu = tekanB;
-
-// 	if (tekanA)
-// 	{
-// 		gerakmotor(arahCW);
-// 	}
-// 	else
-// 	{
-// 		matikanmotor();
-// 	}
-// }
-
-// void gerakmotor(bool clockwise)
-// {
-// 	if (clockwise)
-
-// 	{
-// 		digitalWrite(pinIN1, 1);
-// 		digitalWrite(pinIN2, 0);
-// 	}
-// 	else
-// 	{
-// 		digitalWrite(pinIN1, 0);
-// 		digitalWrite(pinIN2, 1);
-// 	}
-// }
-
-bool Apressed = false;
-bool prevApressed = false;
-// bool motorStarted = false;
-
-void motorSlideGo()
-{
-	if (button.Y == 1 && prevApressed == false)
-	{
-		if (Apressed == false)
-		{
-			Apressed = true;
-			// Serial.println(button.A);
-		}
-		else
-		{
-			Apressed = false;
-		}
-	}
-	prevApressed = button.Y;
-
-	// if (!motorStarted)
-	// {
-	// 	setMotor(motorup, motordown, 0);
-	// 	return;
-	// }
-
-	int limit_A = digitalRead(limit1);
-	int limit_B = digitalRead(limit2);
-
-	if (!Apressed)
-	{
-
-		if (limit_A == 0 || Apressed) // && Apressed
-		{
-			setMotor(motorup, motordown, 0);
-			// Serial.println("ya");
-		}
-		else
-		{
-
-			setMotor(motorup, motordown, 150);
-			// Serial.println("tidak");
-		}
-	}
-
-	else if (Apressed)
-	{
-		if (limit_B == 0 || !Apressed) // && Apressed
-		{
-			setMotor(motorup, motordown, 0);
-			// Serial.println("ya1");
-		}
-		else
-		{
-
-			setMotor(motorup, motordown, -70);
-			// Serial.println("tidak1");
-		}
-	}
-
-	else
-	{
-		setMotor(motorup, motordown, 0);
-	}
-}
-
-bool Bpressed = false;
-bool prevBpressed = false;
-// bool motorStarted = false;
-
-void motorslide()
-{
-	if (button.B == 1 && prevBpressed == false)
-	{
-		if (Bpressed == false)
-		{
-			Bpressed = true;
-			// Serial.println(button.A);
-		}
-		else
-		{
-			Bpressed = false;
-		}
-	}
-	prevBpressed = button.B;
-
-	// if (!motorStarted)
-	// {
-	// 	setMotor(motorup, motordown, 0);
-	// 	return;
-	// }
-
-	int limit_A = digitalRead(limit3);
-	int limit_B = digitalRead(limit4);
-
-	if (!Bpressed)
-	{
-
-		if (limit_A == 0 || Bpressed) // && Apressed //turun
-		{
-			setMotor(motorpush, motorpull, 0);
-			// Serial.println("ya");
-		}
-		else
-		{
-
-			setMotor(motorpush, motorpull, 40);
-			// Serial.println("tidak");
-		}
-	}
-
-	else if (Bpressed)
-	{
-		if (limit_B == 0 || !Bpressed) // && Apressed //naik
-		{
-			setMotor(motorpush, motorpull, 0);
-			// Serial.println("ya1");
-		}
-		else
-		{
-			setMotor(motorpush, motorpull, -60);
-			// Serial.println("tidak1");
-		}
-	}
-
-	else
-	{
-		setMotor(motorpush, motorpull, 0);
-	}
-}
-
-bool statusRT_Lalu = false;
-bool posisiServo = false;
-
-void kontrolServo()
-{
-	bool tekanRT = button.RT;
-
-	if (tekanRT && !statusRT_Lalu)
-	{
-		posisiServo = !posisiServo;
-
-		if (posisiServo)
-		{
-			myservo.write(60);
-			// delay(1000);
-		}
-		else
-		{
-			myservo.write(0);
-			// delay(500);
-		}
-	}
-
-	statusRT_Lalu = tekanRT;
-}
-
-void lifter()
-{
-	static bool lastButton = 0;
-	static bool solenoid = 0;
-
-	bool Button = button.X;
-
-	if (Button == 1 && lastButton == 0)
-	{
-		solenoid = !solenoid;
-		digitalWrite(sol1, solenoid);
-	}
-
-	lastButton = Button;
-}
-
-void staff()
-{
-	static bool lastButtonState = 0;
-	static bool solenoidState = 0;
-
-	bool currentButton = button.RB;
-
-	if (currentButton == 1 && lastButtonState == 0)
-	{
-		solenoidState = !solenoidState;
-		digitalWrite(sol2, solenoidState);
-	}
-
-	lastButtonState = currentButton;
-}
-
-void grip()
-{
-	static bool lastButtonState = 0;
-	static bool solenoidState = 0;
-
-	bool currentButton = button.A;
-
-	if (currentButton == 1 && lastButtonState == 0)
-	{
-		solenoidState = !solenoidState;
-		digitalWrite(sol3, solenoidState);
-	}
-
-	lastButtonState = currentButton;
-}
-
-void push()
-{
-	static bool lastButtonState = 0;
-	static bool solenoidState = 0;
-
-	bool currentButton = button.B;
-
-	if (currentButton == 1 && lastButtonState == 0)
-	{
-		solenoidState = !solenoidState;
-		digitalWrite(sol4, solenoidState);
-	}
-
-	lastButtonState = currentButton;
-}
-
-void button_list(uint32_t buttons, int joy_axis)
-{
-	// reset
-	button.A = button.B = button.X = button.Y = 0;
-	button.LB = button.RB = button.LT = button.RT = 0;
-	button.start = button.select = button.home = 0;
-
-	// button
-	if (buttons & 2)
-		button.A = 1;
-	if (buttons & 4)
-		button.B = 1;
-	if (buttons & 1)
-		button.X = 1;
-	if (buttons & 8)
-		button.Y = 1;
-	if (buttons & 32)
-		button.RB = 1;
-	if (buttons & 16)
-		button.LB = 1;
-	if (buttons & 64)
-		button.LT = 1;
-	if (buttons & 128)
-		button.RT = 1;
-	if (buttons & 256)
-		button.select = 1;
-	if (buttons & 512)
-		button.start = 1;
-	if (buttons & 4096)
-		button.home = 1;
-
-	// DPAD / HAT
-	button.up = button.down = button.left = button.right = 0;
-
-	switch (joy_axis)
-	{
-	case 0:
-		button.up = 1;
-		break;
-	case 2:
-		button.right = 1;
-		break;
-	case 4:
-		button.down = 1;
-		break;
-	case 6:
-		button.left = 1;
-		break;
-	}
-}
-
-// void printButtonActive()
-// {
-//   if (button.A) Serial.println(" A Press");
-//   if (button.B) Serial.println(" B Press");
-//   if (button.X) Serial.println(" X Press");
-//   if (button.Y) Serial.println(" Y Press");
-
-//   if (button.LB) Serial.println(" LB Press");
-//   if (button.RB) Serial.println(" RB Press");
-//   if (button.LT) Serial.println(" LT Press");
-//   if (button.RT) Serial.println(" RT Press");
-
-//   if (button.start) Serial.println("START");
-//   if (button.select) Serial.println("SELECT");
-//   if (button.home) Serial.println("HOME");
-
-//   if (button.up) Serial.println("UP");
-//   if (button.down) Serial.println("DOWN");
-//   if (button.left) Serial.println("LEFT");
-//   if (button.right) Serial.println("RIGHT");
-// }
-
-// void printAxis()
-// {
-//   Serial.print("AXIS | ");
-
-//   Serial.print("Lx: ");
-//   Serial.print(joy_control[0].getAxis(1) - 128);
-//   Serial.print(" | Ly: ");
-//   Serial.print(joy_control[0].getAxis(0) - 128);
-
-//   Serial.print(" | Rx: ");
-//   Serial.print(joy_control[0].getAxis(5) - 128);
-//   Serial.print(" | Ry: ");
-//   Serial.print(joy_control[0].getAxis(2) - 128);
-
-//   Serial.print(" | HAT: ");
-//   Serial.print(joy_control[0].getAxis(9));
-
-//   Serial.println();
-// }

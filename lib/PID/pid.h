@@ -48,11 +48,14 @@ public:
     void ppr_total(float total_ppr);
 
     float control_angle(float target, float enc, float pwm, float deltaT);
+    float control_count(float target, float enc, float deltaT);
+    float control_count(float target, float enc, float pwm, float deltaT);
     float control_angle_speed(float target_angle, float target_speed, float enc, float deltaT);
     float control_base(float error, float speed, int condition, float deltaT);
     float control_speed(float target, float enc, float deltaT);
     float control_default(float target, float curr, float deltaT);
 
+    void reset();
     float get_filt_vel();
 };
 

@@ -41,6 +41,40 @@ float PID::control_angle(float target, float enc, float pwm, float deltaT)
     return fmax(-1 * pwm, fmin(err.u, pwm));
 }
 
+float PID::control_count(float target, float enc, float deltaT)
+{
+    deg2target = target;
+
+    err.proportional = deg2target - enc;
+    err.integral += err.proportional * deltaT;
+
+    err.integral = fmax(-50.0f, fmin(err.integral, 50.0f));
+
+    err.derivative = (err.proportional - err.previous);
+    err.previous = err.proportional;
+
+    err.u = KP * err.proportional + KI * err.integral + KD * err.derivative;
+
+    return fmax(min_val_, fmin(err.u, max_val_));
+}
+
+float PID::control_count(float target, float enc, float pwm, float deltaT)
+{
+    deg2target = target;
+
+    err.proportional = deg2target - enc;
+    err.integral += err.proportional * deltaT;
+
+    err.integral = fmax(-50.0f, fmin(err.integral, 50.0f));
+
+    err.derivative = (err.proportional - err.previous);
+    err.previous = err.proportional;
+
+    err.u = KP * err.proportional + KI * err.integral + KD * err.derivative;
+
+    return fmax(-1 * pwm, fmin(err.u, pwm));
+}
+
 float PID::control_angle_speed(float target_angle, float target_speed, float enc, float deltaT)
 {
     deg2target = target_angle / PPR;
@@ -119,4 +153,15 @@ float PID::control_default(float target, float curr, float deltaT)
 float PID::get_filt_vel()
 {
     return angular_vel_Filt;
+}
+
+void PID::reset()
+{
+    err.proportional = 0;
+    err.integral = 0;
+    err.derivative = 0;
+    err.previous = 0;
+    err.u = 0;
+    error_integral = 0;
+    error_previous = 0;
 }
