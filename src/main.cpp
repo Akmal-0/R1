@@ -8,29 +8,23 @@
 #include <scurve.h>
 #include <semiauto.h>
 
-// Manager Joystick USB Host
 JoystickManager joyManager;
 ButtonState &button = joyManager.button;
 AxisState &joystick = joyManager.axis;
 
-// Filter S-Curve Pelembut Gerak Base Manual (Jerk-Limited)
 SCurveFilter scurve_x(SCURVE_MAX_ACCEL_LINEAR, SCURVE_MAX_JERK_LINEAR);
 SCurveFilter scurve_y(SCURVE_MAX_ACCEL_LINEAR, SCURVE_MAX_JERK_LINEAR);
 SCurveFilter scurve_wz(SCURVE_MAX_ACCEL_ANGULAR, SCURVE_MAX_JERK_ANGULAR);
 
-// Sensor IMU BNO055 (I2C Wire1: SDA1=16, SCL1=17)
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire1);
 
-// Kontroler Semi-Auto 5 Meter & Encoder Eksternal X/Y
 SemiAutoController semiAuto;
 
-// Kontroler PID Motor Base (4 roda omni)
 PID wheel1(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel2(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel3(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 PID wheel4(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 
-// Kinematika 4-Roda Omniwheel
 Kinematic kinematic(
 	Kinematic::ROBOT_1,
 	MOTOR_MAX_RPS,
@@ -40,15 +34,12 @@ Kinematic kinematic(
 	WHEEL_DIAMETER,
 	ROBOT_DIAMETER);
 
-// Odometri Base
 Odometry odometry;
 
-// Variabel Waktu & Odometri Base
 unsigned long prev_odom_update = 0;
 unsigned long prevT = 0;
 volatile long pos[4];
 
-// Kecepatan Robot Base
 joy joySmoothed;
 joy joyCmd;
 
@@ -72,7 +63,6 @@ void setup()
 {
 	Serial.begin(115200);
 
-	// Inisialisasi pin motor base (PWM 25 kHz, 8-bit)
 	for (int i = 0; i < 4; i++)
 	{
 		pinMode(cw[i], OUTPUT);
@@ -87,21 +77,17 @@ void setup()
 		pinMode(encb[i], INPUT);
 	}
 
-	// Inisialisasi Joystick USB Host & Sensor IMU
 	joyManager.begin();
 	bno.begin();
 	bno.setExtCrystalUse(true);
 
-	// Inisialisasi Semi-Auto & Encoder Eksternal (X & Y)
 	semiAuto.begin();
 
-	// Konfigurasi PPR PID roda
 	wheel1.ppr_total(COUNTS_PER_REV1);
 	wheel2.ppr_total(COUNTS_PER_REV2);
 	wheel3.ppr_total(COUNTS_PER_REV3);
 	wheel4.ppr_total(COUNTS_PER_REV4);
 
-	// Registrasi Interrupt Encoder Roda Base
 	attachInterrupt(digitalPinToInterrupt(enca[0]), readEncoder<0>, RISING);
 	attachInterrupt(digitalPinToInterrupt(enca[1]), readEncoder<1>, RISING);
 	attachInterrupt(digitalPinToInterrupt(enca[2]), readEncoder<2>, RISING);
@@ -112,7 +98,6 @@ void loop()
 {
 	joyManager.task();
 
-	// Tangani kondisi joystick terputus secara fisik
 	if (!joyManager.isConnected())
 	{
 		Emergencystop();
@@ -121,7 +106,6 @@ void loop()
 		return;
 	}
 
-	// Tangani paket laporan data baru dari joystick
 	if (joyManager.update())
 	{
 		if (!joyManager.isReady())
@@ -138,7 +122,6 @@ void loop()
 			prev_odom_update = millis();
 		}
 
-		// Tombol Kontrol Semi-Auto (Maju 5m: Tombol Y, Mundur 5m: Tombol A, Batal: Tombol B)
 		static bool lastBtnY = false;
 		static bool lastBtnA = false;
 		static bool lastBtnB = false;
@@ -170,7 +153,6 @@ void loop()
 		}
 	}
 
-	// Watchdog timeout joystick
 	if (joyManager.isTimeout())
 	{
 		Emergencystop();
@@ -191,10 +173,8 @@ void moveBase()
 	unsigned long currT = micros();
 	float deltaT = ((float)(currT - prevT)) / 1.0e6;
 
-	// Mode 1: Semi-Auto (Gerak lurus maju/mundur otomatis dipandu encoder eksternal)
 	if (semiAuto.isBusy())
 	{
-		// Manual Override: Batalkan semi-auto seketika jika driver menyentuh stik joystick
 		if (joyManager.isManualInput())
 		{
 			semiAuto.cancel();
@@ -212,7 +192,6 @@ void moveBase()
 		}
 	}
 
-	// Mode 2: Manual Joystick
 	if (!semiAuto.isBusy())
 	{
 		float top_speed;
@@ -232,7 +211,6 @@ void moveBase()
 		joyCmd.axis1_y = map(joystick.axis1_y, 0, 128, 0, top_speed);
 		joyCmd.axis0_y = map(joystick.axis0_y, 0, 128, 0, rot_speed);
 
-		// Profil S-Curve untuk translasi dan rotasi manual
 		joySmoothed.axis1_x = scurve_x.update(joyCmd.axis1_x, deltaT);
 		joySmoothed.axis1_y = scurve_y.update(joyCmd.axis1_y, deltaT);
 		joySmoothed.axis0_y = scurve_wz.update(joyCmd.axis0_y, deltaT);
